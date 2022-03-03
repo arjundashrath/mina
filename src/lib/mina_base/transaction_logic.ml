@@ -1365,6 +1365,12 @@ module Make (L : Ledger_intf) : S with type ledger := L.t = struct
 
       type failure_status = Transaction_status.Failure.t option
 
+      let failure_status_to_string = function
+        | None ->
+            "<NO FAILURE>"
+        | Some failure ->
+            Transaction_status.Failure.to_string failure
+
       let assert_with_failure_status b failure_status =
         match (b, failure_status) with
         | false, Some failure ->

@@ -33,6 +33,8 @@ module type Bool_intf = sig
 
   type failure_status
 
+  val failure_status_to_string : failure_status -> string
+
   val assert_with_failure_status : t -> failure_status -> unit
 end
 
@@ -1221,6 +1223,9 @@ module Make (Inputs : Inputs_intf) = struct
     let a', update_permitted, failure_status =
       h.perform (Check_auth { is_start = is_start'; party; account = a })
     in
+    let logger = Logger.create () in
+    [%log debug] "FAILURE STATUS: %s"
+      (Bool.failure_status_to_string failure_status) ;
     let success =
       Bool.(
         local_state.success &&& protocol_state_predicate_satisfied

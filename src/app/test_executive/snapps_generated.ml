@@ -214,28 +214,178 @@ module Make (Inputs : Intf.Test.Inputs_intf) = struct
           in
           [%log info] "Sent payment" )
     in
-    let timeout = Network_time_span.Slots 2 in
+    let get_account_permissions account_id =
+      [%log info] "Getting account permissions" ;
+      match%bind.Deferred
+        Network.Node.get_account_permissions ~logger node ~account_id
+      with
+      | Ok permissions ->
+          [%log info] "Got account permissions" ;
+          Malleable_error.return permissions
+      | Error err ->
+          let err_str = Error.to_string_mach err in
+          [%log error] "Error getting account permissions"
+            ~metadata:[ ("error", `String err_str) ] ;
+          Malleable_error.hard_error (Error.of_string err_str)
+    in
+    let get_account_update account_id =
+      [%log info] "Getting account update" ;
+      match%bind.Deferred
+        Network.Node.get_account_update ~logger node ~account_id
+      with
+      | Ok update ->
+          [%log info] "Got account update" ;
+          Malleable_error.return update
+      | Error err ->
+          let err_str = Error.to_string_mach err in
+          [%log error] "Error getting account update"
+            ~metadata:[ ("error", `String err_str) ] ;
+          Malleable_error.hard_error (Error.of_string err_str)
+    in
+    let with_timeout =
+      let soft_slots = 3 in
+      let soft_timeout = Network_time_span.Slots soft_slots in
+      let hard_timeout = Network_time_span.Slots (soft_slots * 2) in
+      Wait_condition.with_timeouts ~soft_timeout ~hard_timeout
+    in
     let%bind () =
       section "Wait for snapp, payment inclusion in transition frontier"
         (let%bind () =
-           wait_for t
-           @@ Wait_condition.with_timeouts ~soft_timeout:timeout
-                ~hard_timeout:timeout
+           wait_for t @@ with_timeout
            @@ Wait_condition.snapp_to_be_included_in_frontier
                 ~parties:parties_valid
          in
          [%log info] "Snapps transaction included in transition frontier" ;
          let%map () =
-           wait_for t
-           @@ Wait_condition.with_timeouts ~soft_timeout:timeout
-                ~hard_timeout:timeout
+           wait_for t @@ with_timeout
            @@ Wait_condition.payment_to_be_included_in_frontier ~sender_pub_key
                 ~receiver_pub_key ~amount
          in
          [%log info] "Payment included in transition frontier")
     in
     let%bind () =
-      section "send a snapp with bad fee payer signature"
+      section "Verify updates for each other party"
+        (let account_id_and_updates =
+           List.map parties_valid.other_parties ~f:(fun party ->
+               let body = party.data.body in
+               let pk = body.public_key in
+               let token_id = body.token_id in
+               let account_id = Mina_base.Account_id.create pk token_id in
+               let update = body.update in
+               (account_id, update))
+         in
+         let%bind all_updates_compatible =
+           Malleable_error.List.for_all account_id_and_updates
+             ~f:(fun (account_id, requested_update) ->
+               let party_metadata =
+                 [ ( "other_party"
+                   , Signature_lib.Public_key.Compressed.to_yojson
+                       (Mina_base.Account_id.public_key account_id) )
+                 ]
+               in
+               let%bind ledger_update = get_account_update account_id in
+               let result =
+                 Snapps_common.compatible_updates ~ledger_update
+                   ~requested_update
+               in
+               ( if result then
+                 [%log info]
+                   "Account permissions for other party equal permissions \
+                    requested to be Set"
+                   ~metadata:party_metadata
+               else
+                 let permissions_metadata =
+                   [ ( "ledger_update"
+                     , Mina_base.Party.Update.to_yojson ledger_update )
+                   ; ( "requested_update"
+                     , Mina_base.Party.Update.to_yojson requested_update )
+                   ]
+                 in
+                 [%log error]
+                   "Account update for other party different from requested \
+                    update"
+                   ~metadata:(party_metadata @ permissions_metadata) ) ;
+               return result)
+         in
+         if all_updates_compatible then (
+           [%log info]
+             "For all other parties, account update compatible with requested \
+              update" ;
+           return () )
+         else (
+           [%log error]
+             "For at least one other party, account update incompatible with \
+              requested update" ;
+           Malleable_error.hard_error
+             (Error.of_string
+                "Account updates incompatible with requested updates") ))
+    in
+    let%bind () =
+      section "Verify requested permissions for each other party"
+        (let account_id_and_permissionss =
+           List.map parties_valid.other_parties ~f:(fun party ->
+               let body = party.data.body in
+               let pk = body.public_key in
+               let token_id = body.token_id in
+               let account_id = Mina_base.Account_id.create pk token_id in
+               let permissions = body.update.permissions in
+               (account_id, permissions))
+         in
+         let%bind all_perms_match =
+           Malleable_error.List.for_all account_id_and_permissionss
+             ~f:(fun (account_id, requested_perms) ->
+               match requested_perms with
+               | Keep ->
+                   (* no permissions requested to be updated, existing permissions are OK *)
+                   return true
+               | Set perms ->
+                   let party_metadata =
+                     [ ( "other_party"
+                       , Signature_lib.Public_key.Compressed.to_yojson
+                           (Mina_base.Account_id.public_key account_id) )
+                     ]
+                   in
+                   let%bind account_permissions =
+                     get_account_permissions account_id
+                   in
+                   let result =
+                     Mina_base.Permissions.equal perms account_permissions
+                   in
+                   ( if result then
+                     [%log info]
+                       "Account permissions for other party equal permissions \
+                        requested to be Set"
+                       ~metadata:party_metadata
+                   else
+                     let permissions_metadata =
+                       [ ( "ledger_permissions"
+                         , Mina_base.Permissions.to_yojson account_permissions
+                         )
+                       ; ( "requested_permissions"
+                         , Mina_base.Permissions.to_yojson perms )
+                       ]
+                     in
+                     [%log error]
+                       "Account permissions for other party different from \
+                        permissions requested to be Set"
+                       ~metadata:(party_metadata @ permissions_metadata) ) ;
+                   return result)
+         in
+         if all_perms_match then (
+           [%log info]
+             "For all other parties, account permissions equal permissions \
+              requested to be Set" ;
+           return () )
+         else (
+           [%log error]
+             "For at least one other party, account permissions do not equal \
+              permissions requested to be Set" ;
+           Malleable_error.hard_error
+             (Error.of_string
+                "Account permissions do not match requested permissions") ))
+    in
+    let%bind () =
+      section "Send a snapp with bad fee payer signature"
         (* update nonce, signatures
 
            we've sent a snapp and payment with the same account, so new nonce is 2

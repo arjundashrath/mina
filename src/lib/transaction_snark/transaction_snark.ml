@@ -1319,6 +1319,8 @@ module Base = struct
 
           type failure_status = unit
 
+          let failure_status_to_string _ = "NO FAILURE STATUS INFORMATION"
+
           let assert_with_failure_status b _failure_status = Assert.is_true b
         end
 
