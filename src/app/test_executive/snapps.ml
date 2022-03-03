@@ -188,6 +188,25 @@ module Make (Inputs : Intf.Test.Inputs_intf) = struct
       in
       (snapp_update, parties_update_all)
     in
+    let parties_invalid_nonce =
+      let p = parties_update_all in
+      { p with
+        fee_payer =
+          { p.fee_payer with
+            data =
+              { p.fee_payer.data with
+                predicate = Mina_base.Account.Nonce.of_int 42
+              }
+          }
+      }
+    in
+    let parties_invalid_signature =
+      let p = parties_update_all in
+      { p with
+        fee_payer =
+          { p.fee_payer with authorization = Mina_base.Signature.dummy }
+      }
+    in
     let with_timeout =
       let soft_slots = 3 in
       let soft_timeout = Network_time_span.Slots soft_slots in
@@ -206,6 +225,28 @@ module Make (Inputs : Intf.Test.Inputs_intf) = struct
             ~metadata:[ ("error", `String err_str) ] ;
           Malleable_error.soft_error_format ~value:() "Error sending snapp: %s"
             err_str
+    in
+    let send_invalid_snapp parties substring =
+      [%log info] "Sending snapp" ;
+      match%bind.Deferred Network.Node.send_snapp ~logger node ~parties with
+      | Ok _snapp_id ->
+          [%log error] "Snapps transaction succeeded, expected error \"%s\""
+            substring ;
+          Malleable_error.soft_error_format ~value:()
+            "Snapps transaction succeeded, expected error \"%s\"" substring
+      | Error err ->
+          let err_str = Error.to_string_mach err in
+          if String.is_substring ~substring err_str then (
+            [%log info] "Snapps transaction failed as expected"
+              ~metadata:[ ("error", `String err_str) ] ;
+            Malleable_error.return () )
+          else (
+            [%log error]
+              "Error sending snapp, for a reason other than the expected \"%s\""
+              substring
+              ~metadata:[ ("error", `String err_str) ] ;
+            Malleable_error.soft_error_format ~value:()
+              "Snapp failed: %s, but expected \"%s\"" err_str substring )
     in
     let get_account_permissions () =
       [%log info] "Getting account permissions" ;
@@ -236,6 +277,82 @@ module Make (Inputs : Intf.Test.Inputs_intf) = struct
           [%log error] "Error getting account update"
             ~metadata:[ ("error", `String err_str) ] ;
           Malleable_error.hard_error (Error.of_string err_str)
+    in
+    let compatible_updates ~(ledger_update : Mina_base.Party.Update.t)
+        ~(requested_update : Mina_base.Party.Update.t) : bool =
+      (* the "update" in the ledger is derived from the account
+
+         if the requested update has `Set` for a field, we
+         should see `Set` for the same value in the ledger update
+
+         if the requested update has `Keep` for a field, any
+         value in the ledger update is acceptable
+
+         for the app state, we apply this principle element-wise
+      *)
+      let open Mina_base.Snapp_basic.Set_or_keep in
+      let compat req_item ledg_item ~equal =
+        match (req_item, ledg_item) with
+        | Keep, _ ->
+            true
+        | Set v1, Set v2 ->
+            equal v1 v2
+        | Set _, Keep ->
+            false
+      in
+      let app_states_compat =
+        let fs_requested =
+          Pickles_types.Vector.Vector_8.to_list requested_update.app_state
+        in
+        let fs_ledger =
+          Pickles_types.Vector.Vector_8.to_list ledger_update.app_state
+        in
+        List.for_all2_exn fs_requested fs_ledger ~f:(fun req ledg ->
+            compat req ledg ~equal:Pickles.Backend.Tick.Field.equal)
+      in
+      let delegates_compat =
+        compat requested_update.delegate ledger_update.delegate
+          ~equal:Signature_lib.Public_key.Compressed.equal
+      in
+      let verification_keys_compat =
+        compat requested_update.verification_key ledger_update.verification_key
+          ~equal:
+            [%equal:
+              ( Pickles.Side_loaded.Verification_key.t
+              , Pickles.Backend.Tick.Field.t )
+              With_hash.t]
+      in
+      let permissions_compat =
+        compat requested_update.permissions ledger_update.permissions
+          ~equal:Mina_base.Permissions.equal
+      in
+      let snapp_uris_compat =
+        compat requested_update.snapp_uri ledger_update.snapp_uri
+          ~equal:String.equal
+      in
+      let token_symbols_compat =
+        compat requested_update.token_symbol ledger_update.token_symbol
+          ~equal:String.equal
+      in
+      let timings_compat =
+        compat requested_update.timing ledger_update.timing
+          ~equal:Mina_base.Party.Update.Timing_info.equal
+      in
+      let voting_fors_compat =
+        compat requested_update.voting_for ledger_update.voting_for
+          ~equal:Mina_base.State_hash.equal
+      in
+      List.for_all
+        [ app_states_compat
+        ; delegates_compat
+        ; verification_keys_compat
+        ; permissions_compat
+        ; snapp_uris_compat
+        ; token_symbols_compat
+        ; timings_compat
+        ; voting_fors_compat
+        ]
+        ~f:Fn.id
     in
     let wait_for_snapp parties =
       let%map () =
@@ -295,9 +412,7 @@ module Make (Inputs : Intf.Test.Inputs_intf) = struct
     let%bind () =
       section "Verify snapp updates in ledger"
         (let%bind ledger_update = get_account_update () in
-         if
-           Snapps_common.compatible_updates ~ledger_update
-             ~requested_update:snapp_update_all
+         if compatible_updates ~ledger_update ~requested_update:snapp_update_all
          then (
            [%log info] "Ledger update and requested update are compatible" ;
            return () )
@@ -312,6 +427,14 @@ module Make (Inputs : Intf.Test.Inputs_intf) = struct
            Malleable_error.hard_error
              (Error.of_string
                 "Ledger update and requested update are incompatible") ))
+    in
+    let%bind () =
+      section "Send a snapp with an invalid nonce"
+        (send_invalid_snapp parties_invalid_nonce "Invalid_nonce")
+    in
+    let%bind () =
+      section "Send a snapp with an invalid signature"
+        (send_invalid_snapp parties_invalid_signature "Invalid_signature")
     in
     return ()
 end
